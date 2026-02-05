@@ -1,0 +1,41 @@
+# ZENSE BCI Project - Git Ignore
+
+# ===== Recordings =====
+# Ignore EEG recording data (can be large)
+recordings/
+*.csv
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Arduino =====
+# Build artifacts (if using arduino-cli)
+build/
+*.elf
+*.hex
+*.bin

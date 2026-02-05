@@ -1,10 +1,13 @@
 """
-Real-Time EEG Visualization from Arduino - 2 Channel Version
-Reads 2-channel raw data from Arduino and displays:
+Real-Time EEG Visualization from Arduino UNO Classic - 2 Channel Version
+Reads 2-channel raw data from Arduino UNO (10-bit ADC) and displays:
 1. Raw signal waveforms (both channels)
 2. All brainwave bands over time (line graph)
 Filtering is done in Python for flexibility
 Uses threaded serial reading for robust data capture
+Includes data storage to CSV for later analysis
+
+For Arduino UNO Classic (10-bit ADC, 256Hz sample rate)
 """
 
 import serial
@@ -18,21 +21,142 @@ from collections import deque
 import time
 import threading
 import queue
+import csv
+import os
+from datetime import datetime
 
-# ===== CONFIGURATION =====
-SAMPLE_RATE = 512  # Must match Arduino
-FFT_SIZE = 256     # FFT window size
-BAUD_RATE = 230400
+# ===== CONFIGURATION FOR ARDUINO UNO CLASSIC =====
+SAMPLE_RATE = 256  # Must match Arduino (256 Hz for UNO stability)
+FFT_SIZE = 128     # FFT window size (smaller for lower sample rate)
+BAUD_RATE = 115200 # Standard baud rate for UNO
 NUM_CHANNELS = 2
-ADC_MIDPOINT = 16383 / 2  # 14-bit ADC midpoint
+ADC_MIDPOINT = 1023 / 2  # 10-bit ADC midpoint (511.5)
+ADC_BITS = 10
+
+# ===== SESSION METADATA =====
+print("=" * 60)
+print("    ZENSE BCI - EEG Recording Session Setup (UNO Classic)")
+print("=" * 60)
+
+experiment_name = input("\nExperiment name: ").strip() or "experiment"
+subject_name = input("Subject name/ID: ").strip() or "subject"
+session_note = input("Session notes (optional): ").strip()
+
+# Create data directory if it doesn't exist
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "recordings")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Generate filename with timestamp
+session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+safe_experiment = "".join(c if c.isalnum() or c in "._-" else "_" for c in experiment_name)
+safe_subject = "".join(c if c.isalnum() or c in "._-" else "_" for c in subject_name)
+csv_filename = f"{safe_experiment}_{safe_subject}_{session_timestamp}.csv"
+csv_filepath = os.path.join(DATA_DIR, csv_filename)
+
+print(f"\nData will be saved to: {csv_filepath}")
+
+# ===== DATA STORAGE CLASS =====
+class DataRecorder:
+    """Handles writing EEG data to CSV file"""
+    
+    def __init__(self, filepath, experiment, subject, note):
+        self.filepath = filepath
+        self.file = None
+        self.writer = None
+        self.sample_count = 0
+        self.start_time = None
+        
+        # Store metadata
+        self.metadata = {
+            'experiment': experiment,
+            'subject': subject,
+            'note': note,
+            'start_time': datetime.now().isoformat(),
+            'sample_rate': SAMPLE_RATE,
+            'num_channels': NUM_CHANNELS,
+            'adc_bits': ADC_BITS,
+            'board': 'Arduino UNO Classic'
+        }
+    
+    def start(self):
+        """Open file and write header"""
+        self.file = open(self.filepath, 'w', newline='', encoding='utf-8')
+        self.writer = csv.writer(self.file)
+        
+        # Write metadata as comments
+        self.file.write(f"# ZENSE BCI Recording (Arduino UNO Classic)\n")
+        self.file.write(f"# Experiment: {self.metadata['experiment']}\n")
+        self.file.write(f"# Subject: {self.metadata['subject']}\n")
+        self.file.write(f"# Note: {self.metadata['note']}\n")
+        self.file.write(f"# Start Time: {self.metadata['start_time']}\n")
+        self.file.write(f"# Sample Rate: {self.metadata['sample_rate']} Hz\n")
+        self.file.write(f"# Channels: {self.metadata['num_channels']}\n")
+        self.file.write(f"# ADC Resolution: {self.metadata['adc_bits']} bits\n")
+        self.file.write(f"#\n")
+        
+        # Write CSV header
+        self.writer.writerow([
+            'sample_index',
+            'timestamp_us',      # Arduino microseconds
+            'elapsed_ms',        # Elapsed time in milliseconds
+            'raw_ch0',           # Raw ADC value (centered)
+            'raw_ch1',
+            'filtered_ch0',      # After filtering
+            'filtered_ch1'
+        ])
+        
+        self.start_time = time.time()
+        print(f"Recording started: {self.filepath}")
+    
+    def write_sample(self, timestamp_us, raw_ch0, raw_ch1, filtered_ch0, filtered_ch1):
+        """Write a single sample to the CSV"""
+        if self.writer is None:
+            return
+        
+        elapsed_ms = (time.time() - self.start_time) * 1000
+        
+        self.writer.writerow([
+            self.sample_count,
+            timestamp_us,
+            f"{elapsed_ms:.2f}",
+            f"{raw_ch0:.2f}",
+            f"{raw_ch1:.2f}",
+            f"{filtered_ch0:.4f}",
+            f"{filtered_ch1:.4f}"
+        ])
+        
+        self.sample_count += 1
+        
+        # Flush periodically to prevent data loss
+        if self.sample_count % 256 == 0:
+            self.file.flush()
+    
+    def stop(self):
+        """Close file and finalize recording"""
+        if self.file:
+            # Write footer with summary
+            duration = time.time() - self.start_time if self.start_time else 0
+            self.file.write(f"\n# Recording ended: {datetime.now().isoformat()}\n")
+            self.file.write(f"# Total samples: {self.sample_count}\n")
+            self.file.write(f"# Duration: {duration:.2f} seconds\n")
+            self.file.write(f"# Effective sample rate: {self.sample_count / duration:.2f} Hz\n" if duration > 0 else "")
+            
+            self.file.close()
+            print(f"\nRecording saved: {self.filepath}")
+            print(f"Total samples: {self.sample_count:,}")
+            print(f"Duration: {duration:.2f} seconds")
+
+# Create recorder instance
+recorder = DataRecorder(csv_filepath, experiment_name, subject_name, session_note)
 
 # ===== THREAD-SAFE DATA QUEUE =====
 # Serial thread pushes data here, main thread reads from here
-data_queue = queue.Queue(maxsize=10000)
+data_queue = queue.Queue(maxsize=5000)
 stop_event = threading.Event()
 
 # ===== FILTER DESIGN =====
 # Design filters once at startup for efficiency
+# Adjusted for 256 Hz sample rate
 
 # High-pass filter (0.5 Hz cutoff) - removes DC drift
 hp_sos = signal.butter(2, 0.5, btype='highpass', fs=SAMPLE_RATE, output='sos')
@@ -79,8 +203,8 @@ def find_arduino_port():
 SERIAL_PORT = find_arduino_port()
 
 if SERIAL_PORT is None:
-    print("Could not auto-detect Arduino port.")
-    print("\nAvailable ports:")
+    print("\nCould not auto-detect Arduino port.")
+    print("Available ports:")
     ports = serial.tools.list_ports.comports()
     for i, port in enumerate(ports):
         print(f"  {i}: {port.device} - {port.description}")
@@ -95,12 +219,12 @@ if SERIAL_PORT is None:
         print("No serial ports found! Is Arduino connected?")
         exit(1)
 
-print(f"Using port: {SERIAL_PORT}")
+print(f"\nUsing port: {SERIAL_PORT}")
 
 # ===== CONNECT TO ARDUINO =====
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    print("Connected to Arduino!")
+    print("Connected to Arduino UNO!")
     time.sleep(2)  # Wait for Arduino to reset
     
     # Read and print header info
@@ -120,8 +244,6 @@ def serial_reader_thread():
     Runs continuously in background, pushing parsed data to queue.
     This ensures no samples are missed even if main thread is busy.
     """
-    global last_timestamp, dropped_samples_thread
-    
     last_ts = 0
     dropped = 0
     
@@ -151,12 +273,16 @@ def serial_reader_thread():
                             dropped += int(actual_gap / expected_interval) - 1
                     last_ts = timestamp
                     
+                    # Center around zero
+                    centered_ch0 = raw_ch0 - ADC_MIDPOINT
+                    centered_ch1 = raw_ch1 - ADC_MIDPOINT
+                    
                     # Push to queue (non-blocking)
                     try:
                         data_queue.put_nowait({
                             'timestamp': timestamp,
-                            'ch0': raw_ch0 - ADC_MIDPOINT,
-                            'ch1': raw_ch1 - ADC_MIDPOINT,
+                            'raw_ch0': centered_ch0,
+                            'raw_ch1': centered_ch1,
                             'dropped': dropped
                         })
                     except queue.Full:
@@ -166,8 +292,8 @@ def serial_reader_thread():
                             data_queue.get_nowait()
                             data_queue.put_nowait({
                                 'timestamp': timestamp,
-                                'ch0': raw_ch0 - ADC_MIDPOINT,
-                                'ch1': raw_ch1 - ADC_MIDPOINT,
+                                'raw_ch0': centered_ch0,
+                                'raw_ch1': centered_ch1,
                                 'dropped': dropped
                             })
                         except:
@@ -183,6 +309,9 @@ def serial_reader_thread():
 # Start the serial reader thread
 reader_thread = threading.Thread(target=serial_reader_thread, daemon=True)
 reader_thread.start()
+
+# Start recording
+recorder.start()
 
 # ===== DATA STORAGE =====
 raw_data_ch0 = deque(maxlen=500)    # Last 500 samples for channel 0
@@ -212,10 +341,10 @@ ax1 = fig.add_subplot(gs[0])
 line_ch0, = ax1.plot([], [], 'cyan', linewidth=1.5, label='Channel 0 (A0)')
 line_ch1, = ax1.plot([], [], 'lime', linewidth=1.5, alpha=0.8, label='Channel 1 (A1)')
 ax1.set_xlim(0, 500)
-ax1.set_ylim(-500, 500)
+ax1.set_ylim(-300, 300)  # Adjusted for 10-bit ADC range
 ax1.set_xlabel('Samples', fontsize=10)
 ax1.set_ylabel('Amplitude', fontsize=10)
-ax1.set_title('Real-Time EEG Signal (2 Channels)', fontsize=14, fontweight='bold')
+ax1.set_title('Real-Time EEG Signal (2 Channels) - Arduino UNO', fontsize=14, fontweight='bold')
 ax1.legend(loc='upper right')
 ax1.grid(True, alpha=0.3)
 
@@ -241,7 +370,11 @@ status_text = ax3.text(0.5, 0.5, '', fontsize=11, ha='center', va='center',
                        bbox=dict(boxstyle='round', facecolor='black', alpha=0.8),
                        family='monospace')
 
-fig.suptitle('Brain-Computer Interface - 2 Channel EEG Analysis (Threaded)', 
+# Add recording indicator
+recording_text = ax3.text(0.5, 0.85, f'● RECORDING: {csv_filename}', fontsize=10, 
+                          ha='center', va='center', color='red', fontweight='bold')
+
+fig.suptitle(f'ZENSE BCI (UNO) - {experiment_name} | Subject: {subject_name}', 
              fontsize=16, fontweight='bold', y=0.98)
 
 # ===== SIGNAL PROCESSING FUNCTIONS =====
@@ -263,19 +396,23 @@ def update(frame):
     current_queue_size = data_queue.qsize()
     queue_size_avg = 0.9 * queue_size_avg + 0.1 * current_queue_size
     
-    while not data_queue.empty() and samples_processed < 200:
+    while not data_queue.empty() and samples_processed < 100:
         try:
             data = data_queue.get_nowait()
             
-            raw_ch0 = data['ch0']
-            raw_ch1 = data['ch1']
+            raw_ch0 = data['raw_ch0']
+            raw_ch1 = data['raw_ch1']
+            timestamp = data['timestamp']
             dropped_samples = data['dropped']
             
             # Apply filters
             filtered_ch0 = apply_filters(raw_ch0, 0)
             filtered_ch1 = apply_filters(raw_ch1, 1)
             
-            # Store filtered data
+            # Record to CSV (both raw and filtered)
+            recorder.write_sample(timestamp, raw_ch0, raw_ch1, filtered_ch0, filtered_ch1)
+            
+            # Store filtered data for visualization
             raw_data_ch0.append(filtered_ch0)
             raw_data_ch1.append(filtered_ch1)
             buffer_ch0.append(filtered_ch0)
@@ -297,8 +434,8 @@ def update(frame):
         # Auto-scale Y axis based on data
         all_data = list(raw_data_ch0) + list(raw_data_ch1)
         if len(all_data) > 0:
-            y_min = min(all_data) - 50
-            y_max = max(all_data) + 50
+            y_min = min(all_data) - 30
+            y_max = max(all_data) + 30
             ax1.set_ylim(y_min, y_max)
     
     # Process FFT when buffer is full (using channel 0)
@@ -337,19 +474,19 @@ def update(frame):
             
             # Determine mental state
             if beta > 15:
-                state = "HIGHLY FOCUSED "
+                state = "HIGHLY FOCUSED"
                 color = 'lime'
             elif beta > 10:
-                state = "FOCUSED "
+                state = "FOCUSED"
                 color = 'yellow'
             elif alpha > 25:
-                state = "RELAXED "
+                state = "RELAXED"
                 color = 'cyan'
             elif theta > 20:
-                state = "DROWSY "
+                state = "DROWSY"
                 color = 'orange'
             else:
-                state = "NORMAL "
+                state = "NORMAL"
                 color = 'white'
             
             # Update status text
@@ -374,9 +511,11 @@ def update(frame):
 # ===== START ANIMATION =====
 print("\n" + "="*60)
 print("Starting Real-Time 2-Channel EEG Visualization...")
+print("Board: Arduino UNO Classic (10-bit ADC, 256 Hz)")
 print("Mode: THREADED serial reading for robust capture")
 print("Filters: High-pass 0.5Hz | Notch 50Hz | Low-pass 45Hz")
-print("Close the plot window to stop.")
+print(f"Recording to: {csv_filename}")
+print("Close the plot window to stop and save.")
 print("="*60 + "\n")
 
 try:
@@ -391,3 +530,6 @@ finally:
     reader_thread.join(timeout=1)
     ser.close()
     print("Serial connection closed")
+    
+    # Stop recording and save file
+    recorder.stop()
