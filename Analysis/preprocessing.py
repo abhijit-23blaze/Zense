@@ -144,6 +144,199 @@ class Preprocessor:
         filtered = self.lowpass_filter(filtered, lowpass)
         return filtered
     
+    # ==================== Amplitude Cropping Methods ====================
+    
+    def clip_amplitude(self, data: np.ndarray, threshold: float = 100) -> np.ndarray:
+        """
+        Hard clip amplitude values to threshold.
+        
+        Values exceeding +/- threshold are clipped to threshold.
+        Simple but may distort signal shape.
+        
+        Args:
+            data: Input signal (1D or 2D)
+            threshold: Maximum absolute amplitude value
+            
+        Returns:
+            Clipped signal
+        """
+        return np.clip(data, -threshold, threshold)
+    
+    def interpolate_spikes(self, data: np.ndarray, threshold: float = 100,
+                           method: str = 'linear') -> np.ndarray:
+        """
+        Replace amplitude spikes with interpolated values.
+        
+        Detects samples exceeding threshold and replaces them with
+        linearly interpolated values from surrounding clean samples.
+        Preserves signal shape better than hard clipping.
+        
+        Args:
+            data: Input signal (1D or 2D)
+            threshold: Amplitude threshold for spike detection
+            method: Interpolation method ('linear', 'nearest', or 'zero')
+            
+        Returns:
+            Cleaned signal with spikes interpolated
+        """
+        if data.ndim == 1:
+            return self._interpolate_channel(data, threshold, method)
+        else:
+            return np.array([self._interpolate_channel(ch, threshold, method) 
+                            for ch in data])
+    
+    def _interpolate_channel(self, channel: np.ndarray, threshold: float,
+                              method: str) -> np.ndarray:
+        """Interpolate spikes in a single channel."""
+        cleaned = channel.copy()
+        n = len(channel)
+        
+        # Find spike indices
+        spike_mask = np.abs(channel) > threshold
+        
+        if not np.any(spike_mask):
+            return cleaned  # No spikes
+        
+        # Get clean sample indices
+        clean_indices = np.where(~spike_mask)[0]
+        spike_indices = np.where(spike_mask)[0]
+        
+        if len(clean_indices) < 2:
+            # Not enough clean samples - just clip
+            return np.clip(channel, -threshold, threshold)
+        
+        # Interpolate spike values
+        clean_values = channel[clean_indices]
+        interpolated = np.interp(spike_indices, clean_indices, clean_values)
+        cleaned[spike_indices] = interpolated
+        
+        return cleaned
+    
+    def remove_amplitude_spikes(self, data: np.ndarray, threshold: float = 100,
+                                 margin_samples: int = 10) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+        """
+        Remove segments containing amplitude spikes.
+        
+        Returns data with spike regions removed and list of removed ranges.
+        Use this when you want to completely exclude bad data rather than repair it.
+        
+        Args:
+            data: Input signal (1D or 2D)
+            threshold: Amplitude threshold for spike detection
+            margin_samples: Extra samples to remove around each spike
+            
+        Returns:
+            (cleaned_data, removed_ranges): Cleaned signal and list of (start, end) tuples
+        """
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+            was_1d = True
+        else:
+            was_1d = False
+        
+        n_samples = data.shape[1]
+        
+        # Find all spike locations across all channels
+        spike_mask = np.any(np.abs(data) > threshold, axis=0)
+        
+        # Expand mask with margin
+        expanded_mask = spike_mask.copy()
+        for i in range(1, margin_samples + 1):
+            if i < n_samples:
+                expanded_mask[i:] |= spike_mask[:-i]
+                expanded_mask[:-i] |= spike_mask[i:]
+        
+        # Find contiguous bad regions
+        removed_ranges = []
+        in_bad_region = False
+        start = 0
+        
+        for i, is_bad in enumerate(expanded_mask):
+            if is_bad and not in_bad_region:
+                in_bad_region = True
+                start = i
+            elif not is_bad and in_bad_region:
+                in_bad_region = False
+                removed_ranges.append((start, i))
+        
+        if in_bad_region:
+            removed_ranges.append((start, n_samples))
+        
+        # Create clean mask
+        clean_mask = ~expanded_mask
+        cleaned = data[:, clean_mask]
+        
+        if was_1d:
+            cleaned = cleaned.flatten()
+        
+        return cleaned, removed_ranges
+    
+    def auto_crop(self, data: np.ndarray, method: str = 'iqr',
+                  sensitivity: float = 3.0) -> Tuple[np.ndarray, float]:
+        """
+        Automatically detect and handle amplitude artifacts.
+        
+        Computes an adaptive threshold based on the data statistics
+        and applies interpolation to remove spikes.
+        
+        Args:
+            data: Input signal (1D or 2D)
+            method: 'iqr' (interquartile range) or 'std' (standard deviation)
+            sensitivity: Multiplier for threshold (higher = less aggressive)
+            
+        Returns:
+            (cleaned_data, threshold_used): Cleaned signal and the computed threshold
+        """
+        # Flatten for statistics
+        flat = data.flatten()
+        
+        if method == 'iqr':
+            # IQR-based threshold (robust to outliers)
+            q1 = np.percentile(flat, 25)
+            q3 = np.percentile(flat, 75)
+            iqr = q3 - q1
+            threshold = sensitivity * iqr
+        elif method == 'std':
+            # Standard deviation based
+            threshold = sensitivity * np.std(flat)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'iqr' or 'std'.")
+        
+        # Apply interpolation
+        cleaned = self.interpolate_spikes(data, threshold)
+        
+        return cleaned, threshold
+    
+    def crop_time_range(self, data: np.ndarray, start_sec: float = None,
+                        end_sec: float = None) -> np.ndarray:
+        """
+        Crop data to a specific time range.
+        
+        Args:
+            data: Input signal (1D or 2D)
+            start_sec: Start time in seconds (None = from beginning)
+            end_sec: End time in seconds (None = to end)
+            
+        Returns:
+            Cropped signal
+        """
+        if data.ndim == 1:
+            n_samples = len(data)
+        else:
+            n_samples = data.shape[1]
+        
+        start_idx = 0 if start_sec is None else int(start_sec * self.sample_rate)
+        end_idx = n_samples if end_sec is None else int(end_sec * self.sample_rate)
+        
+        # Clamp to valid range
+        start_idx = max(0, min(start_idx, n_samples - 1))
+        end_idx = max(start_idx + 1, min(end_idx, n_samples))
+        
+        if data.ndim == 1:
+            return data[start_idx:end_idx]
+        else:
+            return data[:, start_idx:end_idx]
+    
     def normalize(self, data: np.ndarray, method: str = 'zscore') -> np.ndarray:
         """
         Normalize signal.
@@ -274,3 +467,52 @@ def epoch_data(data: np.ndarray, sample_rate: int = 256,
         epochs = prep.detect_artifacts(epochs)
         epochs = prep.reject_artifacts(epochs)
     return epochs
+
+
+def crop_amplitude(data: np.ndarray, threshold: float = 100,
+                   method: str = 'interpolate', sample_rate: int = 256) -> np.ndarray:
+    """
+    Crop/clean amplitude spikes from signal.
+    
+    Args:
+        data: Input signal (1D or 2D)
+        threshold: Amplitude threshold for spike detection
+        method: 'clip' (hard limit), 'interpolate' (smooth replacement), 
+                or 'remove' (delete spike regions)
+        sample_rate: Sampling rate in Hz
+        
+    Returns:
+        Cleaned signal
+    """
+    prep = Preprocessor(sample_rate)
+    
+    if method == 'clip':
+        return prep.clip_amplitude(data, threshold)
+    elif method == 'interpolate':
+        return prep.interpolate_spikes(data, threshold)
+    elif method == 'remove':
+        cleaned, _ = prep.remove_amplitude_spikes(data, threshold)
+        return cleaned
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'clip', 'interpolate', or 'remove'.")
+
+
+def auto_clean_signal(data: np.ndarray, sample_rate: int = 256,
+                      sensitivity: float = 3.0) -> Tuple[np.ndarray, float]:
+    """
+    Automatically detect and remove amplitude artifacts.
+    
+    Uses IQR-based adaptive threshold to detect outliers and
+    interpolates them with surrounding clean samples.
+    
+    Args:
+        data: Input signal (1D or 2D)
+        sample_rate: Sampling rate in Hz
+        sensitivity: Higher = less aggressive cleaning (default 3.0)
+        
+    Returns:
+        (cleaned_data, threshold_used)
+    """
+    prep = Preprocessor(sample_rate)
+    return prep.auto_crop(data, sensitivity=sensitivity)
+

@@ -6,7 +6,10 @@ Includes data loading, preprocessing, feature extraction, and ML-based classific
 """
 
 from .data_loader import ZenseDataLoader, load_recording, load_directory
-from .preprocessing import Preprocessor, filter_signal, epoch_data
+from .preprocessing import (
+    Preprocessor, filter_signal, epoch_data, 
+    crop_amplitude, auto_clean_signal
+)
 from .features import FeatureExtractor, extract_all_features
 from .visualization import plot_recording, plot_bands, plot_spectrogram
 
@@ -18,9 +21,12 @@ __all__ = [
     "Preprocessor",
     "filter_signal",
     "epoch_data",
+    "crop_amplitude",
+    "auto_clean_signal",
     "FeatureExtractor",
     "extract_all_features",
     "plot_recording",
     "plot_bands",
     "plot_spectrogram",
 ]
+
